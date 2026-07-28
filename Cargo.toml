@@ -1,0 +1,10 @@
+[package]
+name = "p2p"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iroh = "1.0"
+iroh-blobs = { version = "0.103", features = ["fs-store"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
