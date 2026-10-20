@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use iroh_blobs::api::Store;
 use iroh_blobs::format::collection::Collection;
@@ -11,14 +10,18 @@ use iroh_blobs::{Hash, HashAndFormat};
 use tokio::io::AsyncWriteExt;
 
 use crate::chunker::chunk_file;
+use crate::error::{bail, Context, Result};
 use crate::manifest::{chunk_name, Manifest, MANIFEST_ENTRY};
+use crate::metadata::Metadata;
 
 #[derive(Debug)]
 pub struct PutOutcome {
     pub file_id: Hash,
     pub file_name: String,
     pub file_size: u64,
+    pub file_hash: Hash,
     pub chunk_count: usize,
+    pub created_at_unix: u64,
     pub bytes_saved: u64,
 }
 
@@ -56,7 +59,7 @@ pub async fn put_file(store: &Store, path: &Path) -> Result<PutOutcome> {
         .context("system clock is before the unix epoch")?
         .as_secs();
 
-    let manifest = Manifest::from_chunked(file_name.clone(), &chunked, created_at_unix);
+    let manifest = Manifest::from_chunked(file_name.clone(), &chunked);
     let manifest_bytes = manifest.to_bytes()?;
 
     let manifest_tag = store
@@ -122,13 +125,14 @@ pub async fn put_file(store: &Store, path: &Path) -> Result<PutOutcome> {
         file_id,
         file_name,
         file_size: chunked.file_size,
+        file_hash: chunked.file_hash,
         chunk_count: manifest.chunks.len(),
+        created_at_unix,
         bytes_saved,
     })
 }
 
-pub async fn get_file(store: &Store, id_or_name: &str, output: &Path) -> Result<GetOutcome> {
-    let file_id = resolve_file_id(store, id_or_name).await?;
+pub async fn get_file(store: &Store, file_id: Hash, output: &Path) -> Result<GetOutcome> {
     let (manifest, _entries) = load_manifest(store, file_id).await?;
 
     let tmp_path = temporary_output_path(output);
@@ -151,26 +155,48 @@ pub async fn get_file(store: &Store, id_or_name: &str, output: &Path) -> Result<
     })
 }
 
-pub async fn list_files(store: &Store) -> Result<Vec<FileSummary>> {
+pub async fn list_files(store: &Store, metadata: &Metadata) -> Result<Vec<FileSummary>> {
+    let mut files: HashMap<Hash, FileSummary> = HashMap::new();
+
+    for record in metadata.list_files()? {
+        files.insert(
+            record.file_id,
+            FileSummary {
+                file_id: record.file_id,
+                file_name: record.file_name,
+                file_size: record.file_size,
+                chunk_count: record.chunk_count,
+                created_at_unix: record.created_at_unix,
+            },
+        );
+    }
+
     let mut stream = store
         .tags()
         .list_prefix("file/")
         .await
         .context("failed to list file tags")?;
 
-    let mut files = Vec::new();
-
     while let Some(item) = stream.next().await {
         let tag = item.context("failed to read file tag")?;
 
+        if files.contains_key(&tag.hash) {
+            continue;
+        }
+
         match load_manifest(store, tag.hash).await {
-            Ok((manifest, _)) => files.push(FileSummary {
-                file_id: tag.hash,
-                file_name: manifest.file_name,
-                file_size: manifest.file_size,
-                chunk_count: manifest.chunks.len(),
-                created_at_unix: manifest.created_at_unix,
-            }),
+            Ok((manifest, _)) => {
+                files.insert(
+                    tag.hash,
+                    FileSummary {
+                        file_id: tag.hash,
+                        file_name: manifest.file_name,
+                        file_size: manifest.file_size,
+                        chunk_count: manifest.chunks.len(),
+                        created_at_unix: manifest.created_at_unix,
+                    },
+                );
+            }
             Err(error) => {
                 eprintln!(
                     "warning: skipping unreadable bundle {}: {error:#}",
@@ -180,7 +206,12 @@ pub async fn list_files(store: &Store) -> Result<Vec<FileSummary>> {
         }
     }
 
-    files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    let mut files: Vec<_> = files.into_values().collect();
+    files.sort_by(|a, b| {
+        a.file_name
+            .cmp(&b.file_name)
+            .then_with(|| a.file_id.to_hex().cmp(&b.file_id.to_hex()))
+    });
     Ok(files)
 }
 
@@ -336,6 +367,7 @@ fn temporary_output_path(output: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::FileRecord;
     use iroh_blobs::store::fs::FsStore;
     use tempfile::TempDir;
 
@@ -343,6 +375,10 @@ mod tests {
         FsStore::load(dir.path().join("store"))
             .await
             .expect("failed to open store")
+    }
+
+    fn open_metadata(dir: &TempDir) -> Metadata {
+        Metadata::open(&dir.path().join("metadata.db")).expect("failed to open metadata")
     }
 
     fn multi_chunk_data() -> Vec<u8> {
@@ -368,7 +404,7 @@ mod tests {
         assert_eq!(put.file_size, data.len() as u64);
         assert!(put.chunk_count > 1);
 
-        let get = get_file(store.as_ref(), &put.file_id.to_hex(), &output)
+        let get = get_file(store.as_ref(), put.file_id, &output)
             .await
             .unwrap();
         assert_eq!(get.file_id, put.file_id);
@@ -409,7 +445,7 @@ mod tests {
         assert_eq!(put.file_size, 0);
         assert_eq!(put.chunk_count, 0);
 
-        get_file(store.as_ref(), &put.file_id.to_hex(), &output)
+        get_file(store.as_ref(), put.file_id, &output)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), Vec::<u8>::new());
@@ -433,9 +469,7 @@ mod tests {
         };
 
         let store = open_store(&dir).await;
-        get_file(store.as_ref(), &file_id.to_hex(), &output)
-            .await
-            .unwrap();
+        get_file(store.as_ref(), file_id, &output).await.unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), data);
 
         store.shutdown().await.unwrap();
@@ -451,9 +485,8 @@ mod tests {
         std::fs::write(&input, b"named lookup").unwrap();
 
         put_file(store.as_ref(), &input).await.unwrap();
-        get_file(store.as_ref(), "named.txt", &output)
-            .await
-            .unwrap();
+        let file_id = resolve_file_id(store.as_ref(), "named.txt").await.unwrap();
+        get_file(store.as_ref(), file_id, &output).await.unwrap();
 
         assert_eq!(std::fs::read(&output).unwrap(), b"named lookup");
 
@@ -464,14 +497,30 @@ mod tests {
     async fn list_reports_stored_files() {
         let dir = TempDir::new().unwrap();
         let store = open_store(&dir).await;
+        let metadata = open_metadata(&dir);
 
-        let input = dir.path().join("listed.txt");
-        std::fs::write(&input, b"listed").unwrap();
-        put_file(store.as_ref(), &input).await.unwrap();
+        let recorded_input = dir.path().join("recorded.txt");
+        std::fs::write(&recorded_input, b"recorded").unwrap();
+        let recorded = put_file(store.as_ref(), &recorded_input).await.unwrap();
+        metadata
+            .record_file(&FileRecord {
+                file_id: recorded.file_id,
+                file_name: recorded.file_name.clone(),
+                file_size: recorded.file_size,
+                file_hash: recorded.file_hash,
+                chunk_count: recorded.chunk_count,
+                created_at_unix: recorded.created_at_unix,
+            })
+            .unwrap();
 
-        let files = list_files(store.as_ref()).await.unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].file_name, "listed.txt");
+        let tag_only_input = dir.path().join("tag-only.txt");
+        std::fs::write(&tag_only_input, b"tag only").unwrap();
+        put_file(store.as_ref(), &tag_only_input).await.unwrap();
+
+        let files = list_files(store.as_ref(), &metadata).await.unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].file_name, "recorded.txt");
+        assert_eq!(files[1].file_name, "tag-only.txt");
 
         store.shutdown().await.unwrap();
     }

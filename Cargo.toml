@@ -11,9 +11,12 @@ fastcdc = "5.0"
 futures = "0.3"
 iroh = "1.0"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
+redb = "4.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

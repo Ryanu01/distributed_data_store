@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
 use fastcdc::v2020::FastCDC;
 use iroh_blobs::Hash;
+
+use crate::error::{Context, Result};
 
 pub const MIN_CHUNK_SIZE: usize = 16 * 1024;
 pub const AVG_CHUNK_SIZE: usize = 64 * 1024;

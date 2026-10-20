@@ -2564,10 +2564,13 @@ dependencies = [
  "futures",
  "iroh",
  "iroh-blobs",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

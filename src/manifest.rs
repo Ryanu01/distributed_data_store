@@ -1,10 +1,10 @@
 use std::str::FromStr;
 
-use anyhow::{bail, Context, Result};
 use iroh_blobs::Hash;
 use serde::{Deserialize, Serialize};
 
 use crate::chunker::{ChunkedFile, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
+use crate::error::{bail, Context, Result};
 
 pub const MANIFEST_VERSION: u32 = 1;
 pub const MANIFEST_ENTRY: &str = "manifest.json";
@@ -41,11 +41,15 @@ pub struct Manifest {
     pub file_hash: String,
     pub chunking: ChunkingParams,
     pub chunks: Vec<ChunkRef>,
+    /// Reserved for older manifests. New manifests set this to zero so the
+    /// content-addressed bundle (and therefore the file ID) stays deterministic.
+    /// The real creation time lives in the redb metadata.
+    #[serde(default)]
     pub created_at_unix: u64,
 }
 
 impl Manifest {
-    pub fn from_chunked(file_name: String, chunked: &ChunkedFile, created_at_unix: u64) -> Self {
+    pub fn from_chunked(file_name: String, chunked: &ChunkedFile) -> Self {
         Self {
             version: MANIFEST_VERSION,
             file_name,
@@ -61,7 +65,7 @@ impl Manifest {
                     length: chunk.data.len() as u64,
                 })
                 .collect(),
-            created_at_unix,
+            created_at_unix: 0,
         }
     }
 
@@ -143,7 +147,7 @@ mod tests {
     fn manifest_round_trip() {
         let data = b"manifest round trip".repeat(10_000);
         let chunked = chunk_bytes(&data);
-        let manifest = Manifest::from_chunked("test.bin".into(), &chunked, 123);
+        let manifest = Manifest::from_chunked("test.bin".into(), &chunked);
 
         let bytes = manifest.to_bytes().unwrap();
         let parsed = Manifest::from_bytes(&bytes).unwrap();
@@ -154,10 +158,22 @@ mod tests {
     }
 
     #[test]
+    fn manifest_bytes_are_deterministic() {
+        let data = b"deterministic manifest".repeat(10_000);
+        let chunked = chunk_bytes(&data);
+
+        let first = Manifest::from_chunked("test.bin".into(), &chunked);
+        let second = Manifest::from_chunked("test.bin".into(), &chunked);
+
+        assert_eq!(first.created_at_unix, 0);
+        assert_eq!(first.to_bytes().unwrap(), second.to_bytes().unwrap());
+    }
+
+    #[test]
     fn manifest_rejects_wrong_total_size() {
         let data = b"hello world".to_vec();
         let chunked = chunk_bytes(&data);
-        let mut manifest = Manifest::from_chunked("test.bin".into(), &chunked, 123);
+        let mut manifest = Manifest::from_chunked("test.bin".into(), &chunked);
         manifest.file_size += 1;
 
         assert!(manifest.validate().is_err());
@@ -167,7 +183,7 @@ mod tests {
     fn manifest_rejects_out_of_order_chunks() {
         let data = b"hello world".repeat(10_000);
         let chunked = chunk_bytes(&data);
-        let mut manifest = Manifest::from_chunked("test.bin".into(), &chunked, 123);
+        let mut manifest = Manifest::from_chunked("test.bin".into(), &chunked);
 
         if manifest.chunks.len() > 1 {
             manifest.chunks.swap(0, 1);

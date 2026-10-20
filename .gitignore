@@ -1,9 +1,8 @@
 /target
-explanation.md
-*.txt
 /p2p_data
 /p2p_data_receive
 /test_data
-IMPLEMENTATION_PLAN.md
-p2p.md
-session.txt
+*.db
+*.txt
+identity.key
+downloaded.txt
