@@ -6,6 +6,9 @@ mod error;
 mod identity;
 mod manifest;
 mod metadata;
+mod node;
+mod protocol;
+mod retrieval;
 
 use clap::Parser;
 

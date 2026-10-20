@@ -58,6 +58,11 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
     },
+    /// Run the long-lived storage node.
+    Node {
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -75,6 +80,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             data_dir,
         } => get(&file_id, &output, &data_dir).await,
         Command::List { data_dir } => list(&data_dir).await,
+        Command::Node { data_dir } => node(&data_dir).await,
     }
 }
 
@@ -157,6 +163,26 @@ async fn list(data_dir: &Path) -> Result<()> {
     }
 
     store.shutdown().await?;
+    Ok(())
+}
+
+async fn node(data_dir: &Path) -> Result<()> {
+    let config = Config::new(data_dir);
+    let node = crate::node::Node::start(&config).await?;
+    let addr = node.endpoint.addr();
+
+    println!("Node running:");
+    println!("  node id  : {}", addr.id);
+    println!("  data dir : {}", config.data_dir().display());
+    println!("  files    : {}", node.metadata.list_files()?.len());
+    for transport in &addr.addrs {
+        println!("  address  : {transport:?}");
+    }
+    println!("Press Ctrl+C to stop.");
+
+    tokio::signal::ctrl_c().await?;
+    println!("Shutting down.");
+    node.shutdown().await?;
     Ok(())
 }
 

@@ -6,10 +6,12 @@ iroh `BlobTicket`. The new version adds content-defined chunking, manifests,
 local storage, deduplication, reassembly, persistent node identity, and a redb
 metadata index.
 
-Milestone M1 (chunking, bundles, local storage, identity, metadata) is
-complete. The implementation is currently **local-only**. Networking, peer
-replication, and fault tolerance are not implemented yet; they are the next
-milestones in `IMPLEMENTATION_PLAN.md`.
+Milestone M1 (chunking, bundles, local storage, identity, metadata) and M2a
+(control protocol, peer registry, two-node transfer) are complete. A long-lived
+`p2p node` can serve blobs and control requests, and another node can fetch and
+verify a bundle by HashSeq ticket. The remote CLI flow, local HTTP API, peer
+replication, and fault tolerance are still pending; see
+`IMPLEMENTATION_PLAN.md`.
 
 ---
 
@@ -341,6 +343,7 @@ identical.
 
 - `cargo fmt --check` passes.
 - `cargo clippy --all-targets -- -D warnings` passes.
+- `cargo test` passes 29 tests, including a two-node `MemoryLookup` transfer.
 
 ### Manual end-to-end test
 
@@ -355,13 +358,15 @@ A 1 MiB random file was stored and retrieved:
 
 ## Current Limitations
 
-- **Local only.** Files are not yet sent to or replicated on other peers.
-  `send`/`receive` still transfer a whole raw blob and are not bundle-aware.
+- **Remote CLI flow is not wired yet.** The daemon and retrieval core can move
+  bundles between nodes, but `put/get/list` still operate directly on a local
+  data directory. `send`/`receive` transfer a whole raw blob and are not
+  bundle-aware.
 - **Whole file is read into memory.** The chunker currently reads the complete
   file before splitting it. Large-file streaming should be added before the
   replication milestone.
-- **Peer state is not stored yet.** The `peers` table will arrive with M2; the
-  current redb schema covers files, names, and replicas.
+- **Peer state is basic.** The `peers` table stores `EndpointAddr`, last-seen
+  time, and an online flag, but heartbeats and offline detection are still M4.
 - **No authentication.** The local store is trusted; there is no peer
   authorization or encryption beyond iroh's transport security.
 - **Name collisions.** The `name/` mapping stores only the latest file with a
@@ -375,10 +380,9 @@ The next milestone is remote retrieval, followed by replication and fault
 tolerance:
 
 1. **M2 - Control protocol and two-node transfer**
-   - persistent node daemon owning the store
-   - peer registry backed by redb (the `peers` table)
-   - control protocol for fetching a bundle by file ID
-   - HashSeq ticket output and remote retrieval with fallback
+   - M2a (complete): daemon, control ALPN, peer registry, HashSeq retrieval
+   - M2b: local HTTP API and daemon-backed `put/get/list/status/peers/ticket`
+   - M2c: remote `get <file_id|ticket>`, fallback, and end-to-end docs
 2. **M3 - Replication**
    - replication factor
    - replica tracking

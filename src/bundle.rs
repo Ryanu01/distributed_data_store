@@ -7,6 +7,7 @@ use futures::StreamExt;
 use iroh_blobs::api::Store;
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::{Hash, HashAndFormat};
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use crate::chunker::chunk_file;
@@ -33,7 +34,7 @@ pub struct GetOutcome {
     pub chunk_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSummary {
     pub file_id: Hash,
     pub file_name: String,
@@ -239,7 +240,10 @@ pub async fn resolve_file_id(store: &Store, input: &str) -> Result<Hash> {
     }
 }
 
-async fn load_manifest(store: &Store, file_id: Hash) -> Result<(Manifest, BTreeMap<String, Hash>)> {
+pub(crate) async fn load_manifest(
+    store: &Store,
+    file_id: Hash,
+) -> Result<(Manifest, BTreeMap<String, Hash>)> {
     let collection = Collection::load(file_id, store)
         .await
         .with_context(|| format!("file is not available locally: {}", file_id.to_hex()))?;

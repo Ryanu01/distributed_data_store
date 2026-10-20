@@ -13,9 +13,11 @@ explicitly deferred, but the placement layer is designed as a seam for them.
 
 ## 1. Current State
 
-Milestones **M0 (scaffolding)** and **M1 (chunking, bundles, local storage)**
-are complete. The repository is still a single binary crate, now split into
-focused modules:
+Milestones **M0 (scaffolding)**, **M1 (chunking, bundles, local storage)**, and
+**M2a (control protocol, peer registry, two-node transfer)** are complete. M2b
+(local HTTP API and daemon-backed CLI) and M2c (remote CLI flow and hardening)
+remain. The repository is still a single binary crate, now split into focused
+modules:
 
 - `src/main.rs` - module wiring, tracing setup, dispatch only.
 - `src/cli.rs` - clap definitions and command handlers.
@@ -25,7 +27,10 @@ focused modules:
 - `src/chunker.rs` - FastCDC chunking and BLAKE3 hashing.
 - `src/manifest.rs` - manifest schema and validation.
 - `src/bundle.rs` - Collection creation, tagging, retrieval, reassembly.
-- `src/metadata.rs` - redb `files`, `names`, and `replicas` tables.
+- `src/metadata.rs` - redb `files`, `names`, `replicas`, and `peers` tables.
+- `src/protocol.rs` - versioned control ALPN, framed messages, handler/client.
+- `src/node.rs` - daemon lifecycle and combined blob/control Router.
+- `src/retrieval.rs` - HashSeq ticket creation and bundle download/verification.
 
 Implemented behavior:
 
@@ -183,11 +188,11 @@ already verified by iroh-blobs during transfer.
   chunk count, creation time)
 - `names`: logical file name -> `file_id`
 - `replicas`: `file_id` -> list of `EndpointId`
-- `peers`: `EndpointId` -> serialized `EndpointAddr` + last_seen + status (M2)
+- `peers`: `EndpointId` -> serialized `EndpointAddr` + last_seen + online flag
 - `config`: optional persisted node settings
 
-Implemented in M1: `files`, `names`, `replicas`. `peers` and `config` arrive
-with M2.
+Implemented: `files`, `names`, `replicas`, and `peers`. `config` remains a
+future table.
 
 Values are JSON-encoded where the schema may evolve; keys are raw 32-byte hashes
 or UTF-8 names.
@@ -263,6 +268,9 @@ proven.
 ```bash
 p2p node --data-dir ./data --api 127.0.0.1:7001
 ```
+
+> M2a implements `p2p node --data-dir <dir>` and the blob/control ALPNs. The
+> `--api` flag and HTTP API below arrive in M2b.
 
 - Loads or creates the identity key.
 - Opens the `FsStore` and metadata database.
@@ -414,11 +422,27 @@ across a node restart; re-ingesting an identical file saves chunk bytes.
 
 ### M2 - Control protocol and two-node transfer
 
-- Implement the control ALPN and handler.
-- Implement peer registry commands and `EndpointAddr` persistence.
-- Implement `ticket` output using `BlobTicket` with `BlobFormat::HashSeq`.
-- Implement remote retrieval from a single peer with fallback.
+M2 is split into three slices.
+
+**M2a - transport core (complete)**
+
+- Implement the control ALPN, framed messages, handler, and client.
+- Implement the persistent peer registry.
+- Implement `p2p node --data-dir` with a combined blob/control Router.
+- Implement HashSeq ticket creation and verified bundle download.
 - Add in-process integration tests using `MemoryLookup`.
+
+**M2b - local HTTP API and daemon-backed CLI**
+
+- Add `axum` and `reqwest`.
+- Expose `/health`, `/status`, `/files`, and `/peers`.
+- Move `put/get/list` behind the daemon and add `peers`, `ticket`, `status`.
+
+**M2c - remote CLI flow and hardening**
+
+- Implement `get <file_id|ticket>` end-to-end.
+- Add provider fallback and clearer failure reporting.
+- Document the daemon lifecycle and update the demo flow.
 
 **Acceptance:** Node B fetches a bundle from Node A by ticket/file ID; if A is
 unavailable, retrieval fails cleanly with a useful error and no partial output.

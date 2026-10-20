@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use iroh::{EndpointAddr, EndpointId};
 use iroh_blobs::Hash;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use crate::error::{Context, Result};
 const FILES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("files");
 const NAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("names");
 const REPLICAS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replicas");
+const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -18,6 +20,14 @@ pub struct FileRecord {
     pub file_hash: Hash,
     pub chunk_count: usize,
     pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRecord {
+    pub endpoint_id: EndpointId,
+    pub addr: EndpointAddr,
+    pub last_seen_unix: u64,
+    pub online: bool,
 }
 
 pub struct Metadata {
@@ -47,6 +57,9 @@ impl Metadata {
             write
                 .open_table(REPLICAS)
                 .context("failed to open replicas table")?;
+            write
+                .open_table(PEERS)
+                .context("failed to open peers table")?;
         }
         write.commit().context("failed to commit metadata setup")?;
 
@@ -191,6 +204,86 @@ impl Metadata {
             .transpose()
             .map(Option::unwrap_or_default)
     }
+
+    pub fn upsert_peer(&self, peer: &PeerRecord) -> Result<()> {
+        let value = serde_json::to_vec(peer).context("failed to serialize peer record")?;
+        let key = peer.endpoint_id.to_string();
+
+        let write = self
+            .db
+            .begin_write()
+            .context("failed to start metadata transaction")?;
+        {
+            let mut peers = write
+                .open_table(PEERS)
+                .context("failed to open peers table")?;
+            peers
+                .insert(key.as_str(), value.as_slice())
+                .context("failed to store peer record")?;
+        }
+        write.commit().context("failed to commit peer record")?;
+
+        Ok(())
+    }
+
+    pub fn get_peer(&self, endpoint_id: &EndpointId) -> Result<Option<PeerRecord>> {
+        let read = self
+            .db
+            .begin_read()
+            .context("failed to start metadata read")?;
+        let peers = read
+            .open_table(PEERS)
+            .context("failed to open peers table")?;
+
+        let value = peers
+            .get(endpoint_id.to_string().as_str())
+            .context("failed to read peer record")?;
+
+        value
+            .map(|value| {
+                serde_json::from_slice(value.value()).context("failed to parse peer record")
+            })
+            .transpose()
+    }
+
+    pub fn list_peers(&self) -> Result<Vec<PeerRecord>> {
+        let read = self
+            .db
+            .begin_read()
+            .context("failed to start metadata read")?;
+        let peers = read
+            .open_table(PEERS)
+            .context("failed to open peers table")?;
+
+        let mut records = Vec::new();
+        for entry in peers.iter().context("failed to iterate peers table")? {
+            let (_, value) = entry.context("failed to read peer record")?;
+            records.push(
+                serde_json::from_slice(value.value()).context("failed to parse peer record")?,
+            );
+        }
+
+        Ok(records)
+    }
+
+    pub fn mark_peer_seen(
+        &self,
+        endpoint_id: EndpointId,
+        addr: EndpointAddr,
+        last_seen_unix: u64,
+    ) -> Result<()> {
+        let online = self
+            .get_peer(&endpoint_id)?
+            .map(|record| record.online)
+            .unwrap_or(true);
+
+        self.upsert_peer(&PeerRecord {
+            endpoint_id,
+            addr,
+            last_seen_unix,
+            online,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +364,42 @@ mod tests {
             "persistent.bin"
         );
         assert_eq!(metadata.replicas(file_id).unwrap(), vec!["peer-a"]);
+    }
+
+    #[test]
+    fn tracks_peers() {
+        let dir = TempDir::new().unwrap();
+        let metadata = Metadata::open(&dir.path().join("metadata.db")).unwrap();
+        let secret = iroh::SecretKey::generate();
+        let id = secret.public();
+        let addr = EndpointAddr::new(id);
+
+        metadata.mark_peer_seen(id, addr.clone(), 123).unwrap();
+
+        let peer = metadata.get_peer(&id).unwrap().unwrap();
+        assert_eq!(peer.endpoint_id, id);
+        assert_eq!(peer.addr, addr);
+        assert_eq!(peer.last_seen_unix, 123);
+        assert!(peer.online);
+        assert_eq!(metadata.list_peers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn peers_survive_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("metadata.db");
+        let secret = iroh::SecretKey::generate();
+        let id = secret.public();
+
+        {
+            let metadata = Metadata::open(&path).unwrap();
+            metadata
+                .mark_peer_seen(id, EndpointAddr::new(id), 456)
+                .unwrap();
+        }
+
+        let metadata = Metadata::open(&path).unwrap();
+        let peer = metadata.get_peer(&id).unwrap().unwrap();
+        assert_eq!(peer.last_seen_unix, 456);
     }
 }
