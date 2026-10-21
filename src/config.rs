@@ -4,6 +4,8 @@ pub const DEFAULT_DATA_DIR: &str = "./p2p_data";
 pub const DEFAULT_RECEIVE_DIR: &str = "./p2p_data_receive";
 pub const IDENTITY_FILE: &str = "identity.key";
 pub const METADATA_FILE: &str = "metadata.db";
+pub const API_FILE: &str = "api.addr";
+pub const DEFAULT_API_ADDR: &str = "127.0.0.1:7001";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -32,6 +34,10 @@ impl Config {
     pub fn metadata_path(&self) -> PathBuf {
         self.data_dir.join(METADATA_FILE)
     }
+
+    pub fn api_path(&self) -> PathBuf {
+        self.data_dir.join(API_FILE)
+    }
 }
 
 #[cfg(test)]
@@ -52,5 +58,6 @@ mod tests {
             config.metadata_path(),
             Path::new("/tmp/p2p-test/metadata.db")
         );
+        assert_eq!(config.api_path(), Path::new("/tmp/p2p-test/api.addr"));
     }
 }

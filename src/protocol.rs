@@ -14,6 +14,7 @@ use crate::bundle::{self, FileSummary};
 use crate::error::{bail, Context, Result};
 use crate::manifest::Manifest;
 use crate::metadata::Metadata;
+use crate::metrics::Metrics;
 
 pub const CONTROL_ALPN: &[u8] = b"p2p-storage/control/1";
 pub const CONTROL_VERSION: u32 = 1;
@@ -144,6 +145,7 @@ pub struct ControlHandler {
     store: FsStore,
     metadata: std::sync::Arc<Metadata>,
     endpoint: Endpoint,
+    metrics: Metrics,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -155,11 +157,17 @@ impl fmt::Debug for ControlHandler {
 }
 
 impl ControlHandler {
-    pub fn new(store: FsStore, metadata: std::sync::Arc<Metadata>, endpoint: Endpoint) -> Self {
+    pub fn new(
+        store: FsStore,
+        metadata: std::sync::Arc<Metadata>,
+        endpoint: Endpoint,
+        metrics: Metrics,
+    ) -> Self {
         Self {
             store,
             metadata,
             endpoint,
+            metrics,
         }
     }
 
@@ -212,6 +220,16 @@ impl ControlHandler {
     }
 
     async fn handle_request(&self, request: ControlRequest) -> Result<ControlResponse> {
+        let guard = self.metrics.begin_operation();
+        let result = self.handle_request_inner(request).await;
+        match &result {
+            Ok(_) => guard.finish_success(0),
+            Err(_) => guard.finish_failure(),
+        }
+        result
+    }
+
+    async fn handle_request_inner(&self, request: ControlRequest) -> Result<ControlResponse> {
         match request {
             ControlRequest::Hello { .. } => bail!("hello is only valid as a handshake"),
             ControlRequest::Ping => Ok(ControlResponse::Pong),

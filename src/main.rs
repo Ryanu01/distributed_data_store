@@ -1,11 +1,14 @@
 mod bundle;
 mod chunker;
 mod cli;
+mod client;
 mod config;
 mod error;
+mod http;
 mod identity;
 mod manifest;
 mod metadata;
+mod metrics;
 mod node;
 mod protocol;
 mod retrieval;

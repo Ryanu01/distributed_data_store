@@ -15,7 +15,7 @@ use crate::error::{bail, Context, Result};
 use crate::manifest::{chunk_name, Manifest, MANIFEST_ENTRY};
 use crate::metadata::Metadata;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PutOutcome {
     pub file_id: Hash,
     pub file_name: String,
@@ -26,7 +26,7 @@ pub struct PutOutcome {
     pub bytes_saved: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetOutcome {
     pub file_id: Hash,
     pub file_name: String,

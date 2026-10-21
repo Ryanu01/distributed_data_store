@@ -6,12 +6,12 @@ iroh `BlobTicket`. The new version adds content-defined chunking, manifests,
 local storage, deduplication, reassembly, persistent node identity, and a redb
 metadata index.
 
-Milestone M1 (chunking, bundles, local storage, identity, metadata) and M2a
-(control protocol, peer registry, two-node transfer) are complete. A long-lived
-`p2p node` can serve blobs and control requests, and another node can fetch and
-verify a bundle by HashSeq ticket. The remote CLI flow, local HTTP API, peer
-replication, and fault tolerance are still pending; see
-`IMPLEMENTATION_PLAN.md`.
+Milestones M1 (chunking, bundles, local storage, identity, metadata), M2a
+(control protocol, peer registry, two-node transfer), and M2b (local HTTP API
+and daemon-backed CLI) are complete. A long-lived `p2p node` serves blobs,
+control requests, and a localhost HTTP API, and another node can fetch and
+verify a bundle by HashSeq ticket. Remote CLI retrieval, peer replication, and
+fault tolerance are still pending; see `IMPLEMENTATION_PLAN.md`.
 
 ---
 
@@ -231,19 +231,52 @@ behind on failure.
 The CLI supports:
 
 ```bash
+p2p node [--data-dir <dir>] [--api <addr>]
+p2p [--api <addr>] put <file> [--data-dir <dir>]
+p2p [--api <addr>] get <file-id-or-name> <output> [--data-dir <dir>]
+p2p [--api <addr>] list [--data-dir <dir>]
+p2p [--api <addr>] status [--data-dir <dir>]
+p2p [--api <addr>] health [--data-dir <dir>]
+p2p [--api <addr>] info <file-id-or-name> [--data-dir <dir>]
+p2p [--api <addr>] ticket <file-id-or-name> [--data-dir <dir>]
+p2p [--api <addr>] peers list [--data-dir <dir>]
+p2p [--api <addr>] peers add <endpoint-id> [--addr <ip:port>] [--data-dir <dir>]
 p2p send <file> [--data-dir <dir>]
 p2p receive <ticket> <output> [--data-dir <dir>]
-p2p put <file> [--data-dir <dir>]
-p2p get <file-id-or-name> <output> [--data-dir <dir>]
-p2p list [--data-dir <dir>]
 ```
 
-The original `send` and `receive` commands are preserved. They now use the
-persistent identity key in the selected data directory instead of generating a
-new endpoint identity on every run.
+The daemon owns the store. `put/get/list/status/health/info/ticket/peers` send
+HTTP requests to it, resolving `127.0.0.1:7001` unless `--api` or the
+`<data-dir>/api.addr` file says otherwise. The original `send` and `receive`
+commands remain direct and use the persistent identity key; they must not run
+against a data directory that a daemon is using.
 
 `put`, `get`, and `list` use `./p2p_data` by default. `receive` uses
 `./p2p_data_receive` by default; all commands accept `--data-dir`.
+
+---
+
+## Local HTTP API and Metrics
+
+The daemon binds `127.0.0.1:7001` by default and exposes `/health`, `/status`,
+`/files`, `/files/{id}`, `/files/{id}/fetch`, `/files/{id}/ticket`, and
+`/peers`. It writes the actual bound address to `<data-dir>/api.addr`, which is
+removed on graceful shutdown. All file paths in HTTP requests are absolute.
+
+`/health` returns:
+
+- `node_id`: the daemon endpoint ID.
+- `free_storage`: available bytes on the disk containing the data directory.
+- `cpu_usage` and `memory_usage`: system percentages.
+- `latency`: milliseconds, an EMA of tracked HTTP/control operations.
+- `bandwidth`: bytes/second, an EMA of successful tracked file operations.
+- `reliability` and `failure_rate`: success and failure ratios in `0..=1`.
+- `current_load`: active tracked operations divided by eight, clamped to
+  `0..=1`.
+
+System values are sampled every two seconds and initialized before the API
+starts. These fields are intended as inputs for later AI-based node ranking;
+the ranking itself is not implemented yet.
 
 ---
 
@@ -254,10 +287,11 @@ The selected data directory contains both the blob store and node metadata:
 ```text
 <data-dir>/
 ├── identity.key        # persistent endpoint secret key (0600 on Unix)
-├── metadata.db         # redb: files, names, replicas
+├── metadata.db         # redb: files, names, replicas, peers
 ├── blobs.db            # iroh-blobs metadata/inline blobs
 ├── data/               # large blob files named by BLAKE3 hash
-└── temp/               # temporary imports
+├── temp/               # temporary imports
+└── api.addr            # live HTTP API address while the daemon runs
 ```
 
 Files are stored inside an iroh-blobs `FsStore` in the same data directory.
@@ -358,10 +392,10 @@ A 1 MiB random file was stored and retrieved:
 
 ## Current Limitations
 
-- **Remote CLI flow is not wired yet.** The daemon and retrieval core can move
-  bundles between nodes, but `put/get/list` still operate directly on a local
-  data directory. `send`/`receive` transfer a whole raw blob and are not
-  bundle-aware.
+- **Remote CLI retrieval is not wired yet.** Local `put/get/list` now go
+  through the daemon, but `get` still reads only from the local store.
+  Ticket-based remote retrieval and provider fallback are M2c. `send`/`receive`
+  transfer a whole raw blob and are not bundle-aware.
 - **Whole file is read into memory.** The chunker currently reads the complete
   file before splitting it. Large-file streaming should be added before the
   replication milestone.
@@ -381,7 +415,8 @@ tolerance:
 
 1. **M2 - Control protocol and two-node transfer**
    - M2a (complete): daemon, control ALPN, peer registry, HashSeq retrieval
-   - M2b: local HTTP API and daemon-backed `put/get/list/status/peers/ticket`
+   - M2b (complete): daemon-owned HTTP API, `api.addr` discovery, CLI commands,
+     and `/health` metrics
    - M2c: remote `get <file_id|ticket>`, fallback, and end-to-end docs
 2. **M3 - Replication**
    - replication factor

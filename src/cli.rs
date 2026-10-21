@@ -1,18 +1,18 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::Endpoint;
+use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::BlobsProtocol;
 
-use crate::bundle;
-use crate::config::{Config, DEFAULT_DATA_DIR, DEFAULT_RECEIVE_DIR};
+use crate::client::ApiClient;
+use crate::config::{Config, DEFAULT_API_ADDR, DEFAULT_DATA_DIR, DEFAULT_RECEIVE_DIR};
 use crate::error::{Context, Result};
 use crate::identity;
-use crate::metadata::{FileRecord, Metadata};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +21,9 @@ use crate::metadata::{FileRecord, Metadata};
     about = "Content-addressed peer-to-peer storage"
 )]
 pub struct Cli {
+    /// Override the local node HTTP API address.
+    #[arg(long, global = true)]
+    pub api: Option<SocketAddr>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -40,13 +43,13 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_RECEIVE_DIR)]
         data_dir: PathBuf,
     },
-    /// Split a file into chunks and store it locally.
+    /// Split a file into chunks and store it through the local node.
     Put {
         file: PathBuf,
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
     },
-    /// Reassemble a locally stored file.
+    /// Reassemble a locally stored file through the local node.
     Get {
         file_id: String,
         output: PathBuf,
@@ -58,6 +61,33 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
     },
+    /// Show local node status.
+    Status {
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
+    /// Show live node health and resource metrics.
+    Health {
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
+    /// Show details for a locally stored file.
+    Info {
+        file_id: String,
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
+    /// Print a HashSeq ticket for a stored file.
+    Ticket {
+        file_id: String,
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
+    /// Manage known peers.
+    Peers {
+        #[command(subcommand)]
+        command: PeersCommand,
+    },
     /// Run the long-lived storage node.
     Node {
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
@@ -65,42 +95,56 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum PeersCommand {
+    /// List known peers.
+    List {
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
+    /// Add a peer by endpoint ID, optionally with a direct IP address.
+    Add {
+        endpoint_id: String,
+        #[arg(long)]
+        addr: Option<SocketAddr>,
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let Cli { api, command } = cli;
+    match command {
         Command::Send { file, data_dir } => send(&file, &data_dir).await,
         Command::Receive {
             ticket,
             output,
             data_dir,
         } => receive(&ticket, &output, &data_dir).await,
-        Command::Put { file, data_dir } => put(&file, &data_dir).await,
+        Command::Put { file, data_dir } => put(&file, &data_dir, api).await,
         Command::Get {
             file_id,
             output,
             data_dir,
-        } => get(&file_id, &output, &data_dir).await,
-        Command::List { data_dir } => list(&data_dir).await,
-        Command::Node { data_dir } => node(&data_dir).await,
+        } => get(&file_id, &output, &data_dir, api).await,
+        Command::List { data_dir } => list(&data_dir, api).await,
+        Command::Status { data_dir } => status(&data_dir, api).await,
+        Command::Health { data_dir } => health(&data_dir, api).await,
+        Command::Info { file_id, data_dir } => info(&file_id, &data_dir, api).await,
+        Command::Ticket { file_id, data_dir } => ticket(&file_id, &data_dir, api).await,
+        Command::Peers { command } => peers(command, api).await,
+        Command::Node { data_dir } => node(&data_dir, api).await,
     }
 }
 
-async fn put(file: &Path, data_dir: &Path) -> Result<()> {
+async fn client(data_dir: &Path, api: Option<SocketAddr>) -> Result<ApiClient> {
     let config = Config::new(data_dir);
-    let store = open_store(&config).await?;
-    let identity = identity::load_or_create(&config.identity_path())?;
-    let metadata = Metadata::open(&config.metadata_path())?;
+    ApiClient::from_config(&config, api)
+}
 
-    let outcome = bundle::put_file(&store, file).await?;
-
-    metadata.record_file(&FileRecord {
-        file_id: outcome.file_id,
-        file_name: outcome.file_name.clone(),
-        file_size: outcome.file_size,
-        file_hash: outcome.file_hash,
-        chunk_count: outcome.chunk_count,
-        created_at_unix: outcome.created_at_unix,
-    })?;
-    metadata.add_replica(outcome.file_id, &identity.public().to_string())?;
+async fn put(file: &Path, data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+    let client = client(data_dir, api).await?;
+    let outcome = client.put_file(file).await?;
 
     println!("Stored file:");
     println!("  file id : {}", outcome.file_id.to_hex());
@@ -108,22 +152,12 @@ async fn put(file: &Path, data_dir: &Path) -> Result<()> {
     println!("  size    : {} bytes", outcome.file_size);
     println!("  chunks  : {}", outcome.chunk_count);
     println!("  dedup   : {} bytes already present", outcome.bytes_saved);
-
-    store.shutdown().await?;
     Ok(())
 }
 
-async fn get(file_id: &str, output: &Path, data_dir: &Path) -> Result<()> {
-    let config = Config::new(data_dir);
-    let store = open_store(&config).await?;
-    let metadata = Metadata::open(&config.metadata_path())?;
-
-    let file_id = match metadata.resolve_name(file_id)? {
-        Some(file_id) => file_id,
-        None => bundle::resolve_file_id(&store, file_id).await?,
-    };
-
-    let outcome = bundle::get_file(&store, file_id, output).await?;
+async fn get(file_id: &str, output: &Path, data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+    let client = client(data_dir, api).await?;
+    let outcome = client.fetch_file(file_id, output).await?;
 
     println!("Retrieved file:");
     println!("  file id : {}", outcome.file_id.to_hex());
@@ -131,16 +165,12 @@ async fn get(file_id: &str, output: &Path, data_dir: &Path) -> Result<()> {
     println!("  size    : {} bytes", outcome.file_size);
     println!("  chunks  : {}", outcome.chunk_count);
     println!("  output  : {}", output.display());
-
-    store.shutdown().await?;
     Ok(())
 }
 
-async fn list(data_dir: &Path) -> Result<()> {
-    let config = Config::new(data_dir);
-    let store = open_store(&config).await?;
-    let metadata = Metadata::open(&config.metadata_path())?;
-    let files = bundle::list_files(&store, &metadata).await?;
+async fn list(data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+    let client = client(data_dir, api).await?;
+    let files = client.list_files().await?;
 
     if files.is_empty() {
         println!("No stored files.");
@@ -162,19 +192,132 @@ async fn list(data_dir: &Path) -> Result<()> {
         }
     }
 
-    store.shutdown().await?;
     Ok(())
 }
 
-async fn node(data_dir: &Path) -> Result<()> {
+async fn status(data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+    let client = client(data_dir, api).await?;
+    let status = client.status().await?;
+
+    println!("Node status:");
+    println!("  node id : {}", status.node_id);
+    println!("  api     : http://{}", status.api_addr);
+    println!("  files   : {}", status.files);
+    println!("  chunks  : {}", status.chunks);
+    println!("  peers   : {}", status.peers);
+    println!("  uptime  : {}s", status.uptime_secs);
+    Ok(())
+}
+
+async fn health(data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+    let client = client(data_dir, api).await?;
+    let health = client.health().await?;
+
+    println!("Node health:");
+    println!("  node id       : {}", health.node_id);
+    println!("  free storage  : {} bytes", health.free_storage);
+    println!("  cpu usage     : {:.2}%", health.cpu_usage);
+    println!("  memory usage  : {:.2}%", health.memory_usage);
+    println!("  latency       : {:.2} ms", health.latency);
+    println!("  bandwidth     : {:.2} bytes/s", health.bandwidth);
+    println!("  reliability   : {:.3}", health.reliability);
+    println!("  failure rate  : {:.3}", health.failure_rate);
+    println!("  current load  : {:.3}", health.current_load);
+    Ok(())
+}
+
+async fn info(file_id: &str, data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+    let client = client(data_dir, api).await?;
+    let details = client.file_details(file_id).await?;
+
+    println!("File details:");
+    println!("  file id : {}", details.file_id.to_hex());
+    println!("  name    : {}", details.manifest.file_name);
+    println!("  size    : {} bytes", details.manifest.file_size);
+    println!("  chunks  : {}", details.manifest.chunks.len());
+    if let Some(record) = details.record {
+        println!("  created : {}", record.created_at_unix);
+    }
+    if details.replicas.is_empty() {
+        println!("  replicas: unknown");
+    } else {
+        println!("  replicas: {}", details.replicas.join(", "));
+    }
+    Ok(())
+}
+
+async fn ticket(file_id: &str, data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+    let client = client(data_dir, api).await?;
+    let response = client.ticket(file_id).await?;
+
+    println!("Share this ticket:");
+    println!("{}", response.ticket);
+    Ok(())
+}
+
+async fn peers(command: PeersCommand, api: Option<SocketAddr>) -> Result<()> {
+    match command {
+        PeersCommand::List { data_dir } => {
+            let client = client(&data_dir, api).await?;
+            let peers = client.list_peers().await?;
+
+            if peers.is_empty() {
+                println!("No known peers.");
+            } else {
+                println!("{:<64}  {:>12}  online", "NODE ID", "LAST SEEN");
+                for peer in peers {
+                    println!(
+                        "{:<64}  {:>12}  {}",
+                        peer.endpoint_id, peer.last_seen_unix, peer.online
+                    );
+                    for address in &peer.addr.addrs {
+                        println!("  address: {address}");
+                    }
+                }
+            }
+        }
+        PeersCommand::Add {
+            endpoint_id,
+            addr,
+            data_dir,
+        } => {
+            let client = client(&data_dir, api).await?;
+            let endpoint_id: EndpointId =
+                endpoint_id.parse().context("invalid peer endpoint ID")?;
+            let mut endpoint = EndpointAddr::new(endpoint_id);
+            if let Some(addr) = addr {
+                endpoint.addrs.insert(TransportAddr::Ip(addr));
+            }
+
+            let peer = client.add_peer(endpoint).await?;
+            println!("Added peer:");
+            println!("  node id : {}", peer.endpoint_id);
+            for address in &peer.addr.addrs {
+                println!("  address : {address}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn node(data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
     let config = Config::new(data_dir);
-    let node = crate::node::Node::start(&config).await?;
+    let api_addr = api.unwrap_or_else(|| {
+        DEFAULT_API_ADDR
+            .parse()
+            .expect("default API address must be valid")
+    });
+    let node = crate::node::Node::start(&config, api_addr).await?;
     let addr = node.endpoint.addr();
+    let health = node.metrics.snapshot();
 
     println!("Node running:");
     println!("  node id  : {}", addr.id);
     println!("  data dir : {}", config.data_dir().display());
+    println!("  api      : http://{}", node.api_addr);
     println!("  files    : {}", node.metadata.list_files()?.len());
+    println!("  free     : {} bytes", health.free_storage);
     for transport in &addr.addrs {
         println!("  address  : {transport:?}");
     }
@@ -184,21 +327,6 @@ async fn node(data_dir: &Path) -> Result<()> {
     println!("Shutting down.");
     node.shutdown().await?;
     Ok(())
-}
-
-async fn open_store(config: &Config) -> Result<FsStore> {
-    tokio::fs::create_dir_all(config.data_dir())
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create data directory {}",
-                config.data_dir().display()
-            )
-        })?;
-
-    FsStore::load(config.store_path())
-        .await
-        .with_context(|| format!("failed to open store at {}", config.store_path().display()))
 }
 
 async fn open_endpoint(config: &Config) -> Result<Endpoint> {

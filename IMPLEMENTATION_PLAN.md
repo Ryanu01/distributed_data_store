@@ -13,11 +13,11 @@ explicitly deferred, but the placement layer is designed as a seam for them.
 
 ## 1. Current State
 
-Milestones **M0 (scaffolding)**, **M1 (chunking, bundles, local storage)**, and
-**M2a (control protocol, peer registry, two-node transfer)** are complete. M2b
-(local HTTP API and daemon-backed CLI) and M2c (remote CLI flow and hardening)
-remain. The repository is still a single binary crate, now split into focused
-modules:
+Milestones **M0 (scaffolding)**, **M1 (chunking, bundles, local storage)**,
+**M2a (control protocol, peer registry, two-node transfer)**, and **M2b (local
+HTTP API and daemon-backed CLI)** are complete. M2c (remote CLI flow and
+hardening) remains. The repository is still a single binary crate, now split
+into focused modules:
 
 - `src/main.rs` - module wiring, tracing setup, dispatch only.
 - `src/cli.rs` - clap definitions and command handlers.
@@ -31,28 +31,33 @@ modules:
 - `src/protocol.rs` - versioned control ALPN, framed messages, handler/client.
 - `src/node.rs` - daemon lifecycle and combined blob/control Router.
 - `src/retrieval.rs` - HashSeq ticket creation and bundle download/verification.
+- `src/http.rs` - local Axum API for health, status, files, tickets, and peers.
+- `src/client.rs` - HTTP client and `api.addr` discovery for CLI commands.
+- `src/metrics.rs` - node resource/operation metrics for `/health`.
 
 Implemented behavior:
 
-- `p2p put <file>` chunks a file, stores `manifest.json` plus chunk blobs as an
-  iroh `Collection`, tags the root, and records the file and local replica in
-  redb.
-- `p2p get <file-id|name> <output>` resolves the ID, verifies every chunk and
-  the whole-file hash, and writes atomically.
-- `p2p list` merges redb records with `file/` tags for pre-metadata bundles.
+- `p2p node --data-dir <dir> [--api <addr>]` runs the long-lived daemon and
+  serves the blob ALPN, control ALPN, and local HTTP API.
+- `p2p put <file>` and `p2p get <file-id|name> <output>` send requests to the
+  daemon, which chunks, stores, verifies, and writes through the owned store.
+- `p2p list`, `p2p status`, `p2p health`, `p2p info`, `p2p ticket`, and
+  `p2p peers list/add` are daemon-backed.
 - `p2p send`/`p2p receive` preserve the original whole-file blob-ticket flow
-  and now use the persistent identity key. All commands accept `--data-dir`.
+  and use the persistent identity key. All commands accept `--data-dir`; all
+  commands except `send`/`receive` accept global `--api`.
 - Deduplication is chunk-level and identical files produce the same file ID.
+- `/health` reports live resource and operation metrics for later AI-based
+  node ranking.
 
-Tests: 21 unit tests pass, covering chunking, manifests, identity, redb
-metadata, bundle round-trips, dedup, restart persistence, name lookup, and
-listing. `cargo fmt --check` and
-`cargo clippy --all-targets -- -D warnings` pass.
+Tests: 35 unit/integration tests pass, covering chunking, manifests, identity,
+redb metadata, bundle round-trips, dedup, restart persistence, name lookup,
+listing, HTTP API operations, peer registry, two-node transfer, and metrics.
+`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass.
 
 What is missing (next milestones):
 
-- Node daemon and control protocol (M2).
-- Peer registry and remote retrieval/fallback (M2).
+- Remote retrieval by ticket/file ID and provider fallback (M2c).
 - Replication factor, placement policy, and replica reporting (M3).
 - Heartbeats, offline detection, repair, and fault-injection tests (M4).
 - Benchmarks, demo script, and monitoring output (M5).
@@ -269,8 +274,7 @@ proven.
 p2p node --data-dir ./data --api 127.0.0.1:7001
 ```
 
-> M2a implements `p2p node --data-dir <dir>` and the blob/control ALPNs. The
-> `--api` flag and HTTP API below arrive in M2b.
+M2b implements the `--api` flag, `api.addr` discovery, and the HTTP API below.
 
 - Loads or creates the identity key.
 - Opens the `FsStore` and metadata database.
@@ -282,14 +286,15 @@ p2p node --data-dir ./data --api 127.0.0.1:7001
 ### Client commands
 
 ```bash
-p2p put <file> [--replicas 3]
-p2p get <file_id|ticket> <output>
-p2p list
-p2p status
-p2p peers add <endpoint-id> [--addr <endpoint-addr>]
-p2p peers list
-p2p ticket <file_id>
-p2p repair [--file <file_id>]
+p2p [--api <addr>] put <file>
+p2p [--api <addr>] get <file_id|name> <output>
+p2p [--api <addr>] list
+p2p [--api <addr>] status
+p2p [--api <addr>] health
+p2p [--api <addr>] info <file_id|name>
+p2p [--api <addr>] ticket <file_id|name>
+p2p [--api <addr>] peers list
+p2p [--api <addr>] peers add <endpoint-id> [--addr <ip:port>]
 ```
 
 Client commands talk to the local daemon over HTTP. This allows any node to
@@ -300,14 +305,21 @@ fault-tolerance behavior.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Node id, version, online status |
-| GET | `/status` | Files, chunks, peers, replica summary |
-| POST | `/files` | Ingest a local path (`{"path": "...", "replicas": 3}`) |
-| GET | `/files/:id` | Manifest and replica locations |
-| POST | `/files/:id/fetch` | Retrieve to an output path |
+| GET | `/health` | Node id, storage, CPU, memory, latency, bandwidth, reliability, failure rate, load |
+| GET | `/status` | Node id, files, chunks, peers, API address, uptime |
+| GET | `/files` | List stored files |
+| POST | `/files` | Ingest a local path (`{"path": "..."}`) |
+| GET | `/files/{id}` | Manifest, metadata record, and replicas |
+| POST | `/files/{id}/fetch` | Retrieve to an output path (`{"output": "..."}`) |
+| GET | `/files/{id}/ticket` | HashSeq ticket for the file |
 | GET | `/peers` | List known peers |
-| POST | `/peers` | Add a peer |
-| POST | `/repair` | Trigger a repair pass |
+| POST | `/peers` | Add a peer (`{"endpoint": {...}}`) |
+
+`/health` metrics are sampled every two seconds. `free_storage` is bytes,
+`cpu_usage`/`memory_usage` are percentages, `latency` is milliseconds,
+`bandwidth` is bytes/second, `reliability`/`failure_rate` are ratios in `0..=1`,
+and `current_load` is active tracked operations divided by eight, clamped to
+`0..=1`. The repair endpoint is deferred to M4.
 
 Bind to `127.0.0.1` by default; no authentication is needed for the capstone
 demo, but this must be documented as a local-only API.
@@ -432,11 +444,14 @@ M2 is split into three slices.
 - Implement HashSeq ticket creation and verified bundle download.
 - Add in-process integration tests using `MemoryLookup`.
 
-**M2b - local HTTP API and daemon-backed CLI**
+**M2b - local HTTP API and daemon-backed CLI (complete)**
 
 - Add `axum` and `reqwest`.
-- Expose `/health`, `/status`, `/files`, and `/peers`.
-- Move `put/get/list` behind the daemon and add `peers`, `ticket`, `status`.
+- Expose `/health`, `/status`, `/files`, `/files/{id}`, `/files/{id}/fetch`,
+  `/files/{id}/ticket`, and `/peers`.
+- Move `put/get/list` behind the daemon and add `peers`, `ticket`, `status`,
+  `health`, and `info`.
+- Track resource and operation metrics for `/health`.
 
 **M2c - remote CLI flow and hardening**
 
