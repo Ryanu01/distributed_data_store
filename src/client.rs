@@ -10,7 +10,7 @@ use crate::bundle::{FileSummary, GetOutcome, PutOutcome};
 use crate::config::Config;
 use crate::error::{bail, Context, Result};
 use crate::http::{
-    AddPeerRequest, FetchFileRequest, FileDetailsResponse, PutFileRequest, StatusResponse,
+    AddPeerRequest, FetchRequest, FileDetailsResponse, PutFileRequest, StatusResponse,
     TicketResponse,
 };
 use crate::metadata::PeerRecord;
@@ -70,12 +70,15 @@ impl ApiClient {
             .await
     }
 
-    pub async fn fetch_file(&self, file_id: &str, output: &Path) -> Result<GetOutcome> {
+    pub async fn fetch_file(&self, target: &str, output: &Path) -> Result<GetOutcome> {
         let output = std::path::absolute(output)
             .with_context(|| format!("failed to resolve {}", output.display()))?;
         self.post_json(
-            self.url(&["files", file_id, "fetch"])?,
-            &FetchFileRequest { output },
+            self.url(&["fetch"])?,
+            &FetchRequest {
+                target: target.to_string(),
+                output,
+            },
         )
         .await
     }
@@ -124,13 +127,21 @@ async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        bail!("node returned {status}: {body}");
+        let message = serde_json::from_str::<ErrorResponse>(&body)
+            .map(|response| response.error)
+            .unwrap_or(body);
+        bail!("node returned {status}: {message}");
     }
 
     response
         .json()
         .await
         .context("failed to decode node response")
+}
+
+#[derive(serde::Deserialize)]
+struct ErrorResponse {
+    error: String,
 }
 
 pub fn resolve_api_addr(config: &Config, api: Option<SocketAddr>) -> Result<SocketAddr> {

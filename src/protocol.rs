@@ -285,21 +285,15 @@ impl ProtocolHandler for ControlHandler {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ControlClient {
     endpoint: Endpoint,
     addr: EndpointAddr,
 }
 
-#[allow(dead_code)]
 impl ControlClient {
     pub fn new(endpoint: Endpoint, addr: EndpointAddr) -> Self {
         Self { endpoint, addr }
-    }
-
-    pub fn addr(&self) -> &EndpointAddr {
-        &self.addr
     }
 
     pub async fn request(&self, request: &ControlRequest) -> Result<ControlResponse> {

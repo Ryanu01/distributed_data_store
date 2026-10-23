@@ -2,6 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -18,6 +19,8 @@ use crate::identity;
 use crate::metadata::Metadata;
 use crate::metrics::Metrics;
 use crate::protocol::{ControlHandler, CONTROL_ALPN};
+
+const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Node {
     pub endpoint: Endpoint,
@@ -57,7 +60,15 @@ impl Node {
             .bind()
             .await
             .context("failed to bind iroh endpoint")?;
-        endpoint.online().await;
+        if tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "endpoint did not reach online state within {}s; starting with local addresses",
+                ENDPOINT_ONLINE_TIMEOUT.as_secs()
+            );
+        }
 
         Self::start_with_endpoint(config, endpoint, api_addr).await
     }
@@ -340,9 +351,24 @@ mod tests {
         assert_eq!(ticket.addr().id, node_a.endpoint.id());
 
         let output = dir_b.path().join("payload.out");
-        retrieval::fetch_by_ticket(&node_b.endpoint, node_b.store.as_ref(), &ticket, &output)
-            .await
-            .unwrap();
+        let provider = retrieval::fetch_from_providers(
+            &node_b.endpoint,
+            node_b.store.as_ref(),
+            std::slice::from_ref(ticket.addr()),
+            ticket.hash(),
+        )
+        .await
+        .unwrap();
+        retrieval::finalize_download(
+            &node_b.endpoint,
+            node_b.store.as_ref(),
+            &node_b.metadata,
+            &provider,
+            ticket.hash(),
+            &output,
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), data);
 
         assert!(bundle::load_manifest(node_b.store.as_ref(), file_id)
@@ -424,6 +450,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_remote_get_by_ticket_caches_bundle() {
+        let (dir_a, dir_b, node_a, node_b) = start_pair().await;
+        let (file_id, data) = store_file(&node_a, &dir_a).await;
+
+        let client_a = ApiClient::new(node_a.api_addr).unwrap();
+        let ticket = client_a.ticket(&file_id.to_hex()).await.unwrap().ticket;
+        let target = ticket.to_string();
+        let client_b = ApiClient::new(node_b.api_addr).unwrap();
+
+        let output = dir_b.path().join("ticket-output.bin");
+        let get = client_b.fetch_file(&target, &output).await.unwrap();
+        assert_eq!(get.file_id, file_id);
+        assert_eq!(std::fs::read(&output).unwrap(), data);
+
+        assert!(node_b.metadata.get_file(file_id).unwrap().is_some());
+        assert_eq!(
+            node_b.metadata.replicas(file_id).unwrap(),
+            vec![node_b.endpoint.id().to_string()]
+        );
+        assert!(node_b
+            .metadata
+            .get_peer(&node_a.endpoint.id())
+            .unwrap()
+            .is_some());
+
+        node_a.shutdown().await.unwrap();
+
+        let cached_output = dir_b.path().join("ticket-cached.bin");
+        client_b.fetch_file(&target, &cached_output).await.unwrap();
+        assert_eq!(std::fs::read(&cached_output).unwrap(), data);
+
+        node_b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_remote_get_by_file_id_uses_known_peer() {
+        let (dir_a, dir_b, node_a, node_b) = start_pair().await;
+        let (file_id, data) = store_file(&node_a, &dir_a).await;
+        let client_b = ApiClient::new(node_b.api_addr).unwrap();
+        let target = file_id.to_hex();
+
+        let missing_output = dir_b.path().join("file-id-missing.bin");
+        let error = client_b
+            .fetch_file(&target, &missing_output)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("no known peer advertises it"));
+        assert!(!missing_output.exists());
+
+        client_b.add_peer(node_a.endpoint.addr()).await.unwrap();
+
+        let output = dir_b.path().join("file-id-output.bin");
+        let get = client_b.fetch_file(&target, &output).await.unwrap();
+        assert_eq!(get.file_id, file_id);
+        assert_eq!(std::fs::read(&output).unwrap(), data);
+
+        node_b.shutdown().await.unwrap();
+        node_a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_remote_get_falls_back_from_ticket_provider() {
+        let (dir_a, dir_b, node_a, node_b) = start_pair().await;
+        let (file_id, data) = store_file(&node_a, &dir_a).await;
+        let client_b = ApiClient::new(node_b.api_addr).unwrap();
+        client_b.add_peer(node_a.endpoint.addr()).await.unwrap();
+
+        let unavailable = iroh::SecretKey::generate().public();
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            EndpointAddr::new(unavailable),
+            file_id,
+            BlobFormat::HashSeq,
+        );
+
+        let output = dir_b.path().join("fallback-output.bin");
+        let get = client_b
+            .fetch_file(&ticket.to_string(), &output)
+            .await
+            .unwrap();
+        assert_eq!(get.file_id, file_id);
+        assert_eq!(std::fs::read(&output).unwrap(), data);
+
+        node_b.shutdown().await.unwrap();
+        node_a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_rejects_invalid_ticket_without_output() {
+        let (dir_a, dir_b, node_a, node_b) = start_pair().await;
+        let _ = dir_a;
+        let client_b = ApiClient::new(node_b.api_addr).unwrap();
+        let output = dir_b.path().join("invalid-ticket.bin");
+
+        let error = client_b
+            .fetch_file("blobnot-a-valid-ticket", &output)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid ticket"));
+        assert!(!output.exists());
+
+        let raw_ticket = iroh_blobs::ticket::BlobTicket::new(
+            node_a.endpoint.addr(),
+            Hash::new(b"raw blob"),
+            BlobFormat::Raw,
+        );
+        let error = client_b
+            .fetch_file(&raw_ticket.to_string(), &output)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("chunked bundle"));
+        assert!(!output.exists());
+
+        node_b.shutdown().await.unwrap();
+        node_a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_unavailable_provider_returns_bad_gateway() {
+        let (dir_a, dir_b, node_a, node_b) = start_pair().await;
+        let (file_id, _) = store_file(&node_a, &dir_a).await;
+        let client_b = ApiClient::new(node_b.api_addr).unwrap();
+
+        let unavailable = iroh::SecretKey::generate().public();
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            EndpointAddr::new(unavailable),
+            file_id,
+            BlobFormat::HashSeq,
+        );
+
+        let output = dir_b.path().join("unavailable.bin");
+        let error = client_b
+            .fetch_file(&ticket.to_string(), &output)
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("502 Bad Gateway"));
+        assert!(message.contains("failed to retrieve bundle"));
+        assert!(!output.exists());
+
+        node_b.shutdown().await.unwrap();
+        node_a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unavailable_provider_leaves_no_output() {
         let (dir_a, dir_b, node_a, node_b) = start_pair().await;
         let (file_id, _) = store_file(&node_a, &dir_a).await;
@@ -436,9 +606,13 @@ mod tests {
         );
 
         let output = dir_b.path().join("missing.out");
-        let result =
-            retrieval::fetch_by_ticket(&node_b.endpoint, node_b.store.as_ref(), &ticket, &output)
-                .await;
+        let result = retrieval::fetch_from_providers(
+            &node_b.endpoint,
+            node_b.store.as_ref(),
+            std::slice::from_ref(ticket.addr()),
+            ticket.hash(),
+        )
+        .await;
         assert!(result.is_err());
         assert!(!output.exists());
 

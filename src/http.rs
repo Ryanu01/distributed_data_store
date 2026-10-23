@@ -1,17 +1,19 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::future::join_all;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::ticket::BlobTicket;
-use iroh_blobs::Hash;
+use iroh_blobs::{BlobFormat, Hash};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -19,6 +21,10 @@ use crate::bundle::{self, FileSummary, GetOutcome, PutOutcome};
 use crate::manifest::Manifest;
 use crate::metadata::{FileRecord, Metadata, PeerRecord};
 use crate::metrics::{Metrics, NodeHealth};
+use crate::protocol::{ControlClient, ControlRequest, ControlResponse};
+use crate::retrieval;
+
+const PEER_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -46,7 +52,8 @@ pub struct PutFileRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct FetchFileRequest {
+pub struct FetchRequest {
+    pub target: String,
     pub output: PathBuf,
 }
 
@@ -73,8 +80,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/files", get(list_files).post(put_file))
+        .route("/fetch", post(fetch))
         .route("/files/{id}", get(file_details))
-        .route("/files/{id}/fetch", post(fetch_file))
         .route("/files/{id}/ticket", get(file_ticket))
         .route("/peers", get(list_peers).post(add_peer))
         .with_state(state)
@@ -153,18 +160,167 @@ async fn file_details(
     }))
 }
 
-async fn fetch_file(
+async fn fetch(
     State(state): State<AppState>,
-    UrlPath(id): UrlPath<String>,
-    Json(request): Json<FetchFileRequest>,
+    Json(request): Json<FetchRequest>,
 ) -> ApiResult<Json<GetOutcome>> {
-    let file_id = resolve_local_file(&state, &id).await?;
+    let ticket = parse_ticket(&request.target)?;
+    let file_id = match &ticket {
+        Some(ticket) => ticket.hash(),
+        None => resolve_local_file(&state, &request.target).await?,
+    };
+
     let guard = state.metrics.begin_operation();
-    let outcome = bundle::get_file(state.store.as_ref(), file_id, &request.output)
+
+    if bundle::load_manifest(state.store.as_ref(), file_id)
         .await
-        .map_err(ApiError::not_found)?;
+        .is_ok()
+    {
+        let outcome = bundle::get_file(state.store.as_ref(), file_id, &request.output).await?;
+        guard.finish_success(outcome.file_size);
+        return Ok(Json(outcome));
+    }
+
+    let mut providers = Vec::new();
+    let mut provider_ids = BTreeSet::new();
+
+    if let Some(ticket) = &ticket {
+        add_provider(
+            &mut providers,
+            &mut provider_ids,
+            ticket.addr().clone(),
+            state.endpoint.id(),
+        );
+    }
+
+    for replica in state.metadata.replicas(file_id)? {
+        let Ok(endpoint_id) = replica.parse::<EndpointId>() else {
+            continue;
+        };
+        if endpoint_id == state.endpoint.id() || provider_ids.contains(&endpoint_id) {
+            continue;
+        }
+
+        let addr = state
+            .metadata
+            .get_peer(&endpoint_id)?
+            .map(|peer| peer.addr)
+            .unwrap_or_else(|| EndpointAddr::new(endpoint_id));
+        add_provider(&mut providers, &mut provider_ids, addr, state.endpoint.id());
+    }
+
+    let mut queries = Vec::new();
+    for peer in state.metadata.list_peers()? {
+        if peer.endpoint_id == state.endpoint.id() || provider_ids.contains(&peer.endpoint_id) {
+            continue;
+        }
+
+        let endpoint = state.endpoint.clone();
+        let addr = peer.addr.clone();
+        let request = ControlRequest::GetTicket { file_id };
+        queries.push(async move {
+            let control = ControlClient::new(endpoint, addr.clone());
+            let response =
+                tokio::time::timeout(PEER_QUERY_TIMEOUT, control.request(&request)).await;
+            (addr, response)
+        });
+    }
+
+    for (addr, response) in join_all(queries).await {
+        match response {
+            Ok(Ok(ControlResponse::Ticket { ticket })) if ticket.hash() == file_id => {
+                add_provider(
+                    &mut providers,
+                    &mut provider_ids,
+                    ticket.addr().clone(),
+                    state.endpoint.id(),
+                );
+            }
+            Ok(Ok(ControlResponse::Error { message })) => {
+                tracing::debug!(
+                    peer = %addr.id.fmt_short(),
+                    "peer does not have bundle {}: {message}",
+                    file_id.to_hex()
+                );
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(
+                    peer = %addr.id.fmt_short(),
+                    "unexpected discovery response for {}: {other:?}",
+                    file_id.to_hex()
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    peer = %addr.id.fmt_short(),
+                    "peer discovery failed for {}: {error:#}",
+                    file_id.to_hex()
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    peer = %addr.id.fmt_short(),
+                    "peer discovery timed out for {}",
+                    file_id.to_hex()
+                );
+            }
+        }
+    }
+
+    if providers.is_empty() {
+        return Err(ApiError::NotFound(format!(
+            "file {} is not stored locally and no known peer advertises it; add a holder with `p2p peers add` or retrieve it by ticket",
+            file_id.to_hex()
+        )));
+    }
+
+    let provider =
+        retrieval::fetch_from_providers(&state.endpoint, state.store.as_ref(), &providers, file_id)
+            .await
+            .map_err(|error| ApiError::bad_gateway(format!("{error:#}")))?;
+
+    let outcome = retrieval::finalize_download(
+        &state.endpoint,
+        state.store.as_ref(),
+        &state.metadata,
+        &provider,
+        file_id,
+        &request.output,
+    )
+    .await?;
+
     guard.finish_success(outcome.file_size);
     Ok(Json(outcome))
+}
+
+fn parse_ticket(target: &str) -> ApiResult<Option<BlobTicket>> {
+    if !target.starts_with("blob") {
+        return Ok(None);
+    }
+
+    let ticket: BlobTicket = target
+        .parse()
+        .map_err(|error| ApiError::bad_request(format!("invalid ticket: {error}")))?;
+
+    if ticket.format() != BlobFormat::HashSeq {
+        return Err(ApiError::bad_request(
+            "ticket does not point to a chunked bundle",
+        ));
+    }
+
+    Ok(Some(ticket))
+}
+
+fn add_provider(
+    providers: &mut Vec<EndpointAddr>,
+    provider_ids: &mut BTreeSet<EndpointId>,
+    addr: EndpointAddr,
+    local_id: EndpointId,
+) {
+    if addr.id == local_id || !provider_ids.insert(addr.id) {
+        return;
+    }
+    providers.push(addr);
 }
 
 async fn file_ticket(
@@ -221,6 +377,7 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 pub enum ApiError {
     BadRequest(String),
     NotFound(String),
+    BadGateway(String),
     Internal(anyhow::Error),
 }
 
@@ -231,6 +388,10 @@ impl ApiError {
 
     pub fn not_found(error: impl Into<anyhow::Error>) -> Self {
         Self::NotFound(format!("{:#}", error.into()))
+    }
+
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        Self::BadGateway(message.into())
     }
 }
 
@@ -245,6 +406,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
+            Self::BadGateway(message) => (StatusCode::BAD_GATEWAY, message),
             Self::Internal(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")),
         };
 

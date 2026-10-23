@@ -7,11 +7,13 @@ local storage, deduplication, reassembly, persistent node identity, and a redb
 metadata index.
 
 Milestones M1 (chunking, bundles, local storage, identity, metadata), M2a
-(control protocol, peer registry, two-node transfer), and M2b (local HTTP API
-and daemon-backed CLI) are complete. A long-lived `p2p node` serves blobs,
-control requests, and a localhost HTTP API, and another node can fetch and
-verify a bundle by HashSeq ticket. Remote CLI retrieval, peer replication, and
-fault tolerance are still pending; see `IMPLEMENTATION_PLAN.md`.
+(control protocol, peer registry, two-node transfer), M2b (local HTTP API and
+daemon-backed CLI), and M2c (remote retrieval and hardening) are complete.
+**M2d (name-based retrieval)** is planned next. A long-lived `p2p node` serves
+blobs, control requests, and a localhost HTTP API, and another node can fetch
+and verify a bundle by ticket or file ID. Today a name is resolved only from
+the local metadata; remote name lookup is planned in M2d. Peer replication and
+fault tolerance remain M3/M4; see `IMPLEMENTATION_PLAN.md`.
 
 ---
 
@@ -201,7 +203,7 @@ content-addressed, identical chunks are stored only once.
 
 #### `get_file`
 
-1. Resolves the argument in the CLI as either:
+1. Resolves the argument locally as either:
    - a 64-character hex file ID
    - an `s`-prefixed hash-sequence ID
    - a name from the redb `names` table
@@ -233,7 +235,7 @@ The CLI supports:
 ```bash
 p2p node [--data-dir <dir>] [--api <addr>]
 p2p [--api <addr>] put <file> [--data-dir <dir>]
-p2p [--api <addr>] get <file-id-or-name> <output> [--data-dir <dir>]
+p2p [--api <addr>] get <file-id-or-name-or-ticket> <output> [--data-dir <dir>]
 p2p [--api <addr>] list [--data-dir <dir>]
 p2p [--api <addr>] status [--data-dir <dir>]
 p2p [--api <addr>] health [--data-dir <dir>]
@@ -259,9 +261,9 @@ against a data directory that a daemon is using.
 ## Local HTTP API and Metrics
 
 The daemon binds `127.0.0.1:7001` by default and exposes `/health`, `/status`,
-`/files`, `/files/{id}`, `/files/{id}/fetch`, `/files/{id}/ticket`, and
-`/peers`. It writes the actual bound address to `<data-dir>/api.addr`, which is
-removed on graceful shutdown. All file paths in HTTP requests are absolute.
+`/files`, `/files/{id}`, `/fetch`, `/files/{id}/ticket`, and `/peers`. It writes
+the actual bound address to `<data-dir>/api.addr`, which is removed on graceful
+shutdown. All file paths in HTTP requests are absolute.
 
 `/health` returns:
 
@@ -277,6 +279,170 @@ removed on graceful shutdown. All file paths in HTTP requests are absolute.
 System values are sampled every two seconds and initialized before the API
 starts. These fields are intended as inputs for later AI-based node ranking;
 the ranking itself is not implemented yet.
+
+---
+
+## Remote Retrieval
+
+`p2p get <target> <output>` accepts a local file ID, a local name, or a
+HashSeq ticket. `POST /fetch` carries `{"target": "...", "output": "..."}`.
+Remote retrieval by file ID and ticket is implemented; remote lookup by name is
+the planned M2d extension described below.
+
+Retrieval works as follows:
+
+1. Parse the target and resolve its file ID.
+2. If the bundle is already local, reassemble it without network access.
+3. Build provider candidates:
+   - The ticket's provider, if a ticket was supplied.
+   - Endpoint IDs recorded in the replicas table.
+   - Known peers that advertise the file.
+4. Query known peers concurrently with `GetTicket` and a 3 second timeout.
+5. Connect directly to each provider using its full `EndpointAddr` and fetch the
+   complete HashSeq bundle. Provider connection attempts time out after 5
+   seconds.
+6. Try the next provider if one fails. If all providers fail, return `502` with
+   the attempted providers.
+7. Tag the downloaded bundle, record the file and local replica, and remember
+   the provider as a peer.
+8. Reassemble into a temporary file, verify the hashes, and rename atomically.
+
+Tickets are self-contained: Node B can retrieve from Node A without adding A
+as a peer first. File-ID retrieval requires at least one known peer that has the
+file, added with `p2p peers add`.
+
+Errors are explicit:
+
+- `400`: malformed ticket or a ticket for a raw blob instead of a bundle.
+- `404`: not local, and no known peer advertises the file.
+- `502`: providers were found but every retrieval attempt failed.
+
+A failed download leaves no output file. Partial content-addressed chunks may
+remain in the store, but the file is not tagged or recorded as complete.
+
+Provider fallback is best-effort until M3 adds replication. If only the original
+holder has a file, stopping it still means retrieval fails; fallback helps when
+another peer previously downloaded and cached the bundle.
+
+---
+
+## Planned M2d - Name-Based Retrieval
+
+Status: **planned, not implemented**. The test count remains 40 until this slice
+is built.
+
+The main product flow becomes:
+
+```bash
+p2p get report.pdf ./downloaded.pdf
+```
+
+The user does not need a ticket. The node finds the file by exact filename on
+itself or on a peer it already knows, then downloads and verifies it.
+
+### Selected behavior
+
+- Search only peers already registered with `p2p peers add`.
+- Match names exactly and case-sensitively.
+- A local match always wins and requires no network access.
+- If different files share a name on different peers, the newest
+  `created_at_unix` wins.
+- If the same file ID exists on multiple peers, merge all providers for
+  fallback.
+- Keep ticket and file-ID retrieval as advanced options.
+- M2d does not replace or renumber M3/M4; it is an additive retrieval slice.
+
+### Planned protocol
+
+The control protocol gains:
+
+```rust
+ControlRequest::FindByName { name: String }
+
+ControlResponse::NameMatches { matches: Vec<NameMatch> }
+
+struct NameMatch {
+    file_id: Hash,
+    file_name: String,
+    file_size: u64,
+    chunk_count: usize,
+    created_at_unix: u64,
+    ticket: BlobTicket,
+}
+```
+
+Each peer performs an exact lookup in its local `names` table and returns the
+current mapping, or an empty list. `CONTROL_VERSION` is bumped so mixed-version
+nodes fail explicitly.
+
+### Planned retrieval flow
+
+1. Parse a ticket, local file ID, or name.
+2. Resolve a local name or file ID first. Return immediately if the bundle is
+   already present.
+3. If the target is not local and is not a file ID, query all known peers
+   concurrently with `FindByName` and a 3 second timeout.
+4. Ignore failed or timed-out peers.
+5. Group results by file ID and merge provider addresses for the same file.
+6. Choose the highest `created_at_unix` when different files share the name;
+   break ties by file ID. Local matches still take precedence.
+7. Fetch from the selected file's providers using the existing sequential
+   fallback and 5 second provider timeout.
+8. Finalize, cache, tag, and record the bundle exactly as ticket/file-ID
+   retrieval does now.
+
+### Planned API and CLI
+
+```http
+GET /search?name=report.pdf
+```
+
+Returns grouped local and peer matches, sorted newest first.
+
+```bash
+p2p search report.pdf
+p2p get report.pdf ./downloaded.pdf
+```
+
+`POST /fetch` keeps its current schema; `target` may now be a name that is not
+local.
+
+### Planned errors
+
+- Unknown name: `404`, no output file.
+- Name found but all providers fail: `502`, no output file.
+- Empty or invalid name: `400`.
+- Local name lookup remains offline-capable.
+
+### Planned tests
+
+- `FindByName` returns the exact local match and is case-sensitive.
+- Unknown names return an empty match list.
+- Remote `get <name>` works after adding the holder as a peer.
+- Missing holder in the peer list returns `404` with no output.
+- Non-holding peers are skipped.
+- Newest remote duplicate wins; local names take precedence.
+- Identical file IDs on multiple peers are merged for fallback.
+- `/search` returns local and remote matches.
+- Existing ticket and file-ID tests continue to pass.
+
+Expected total after implementation: roughly 48-50 tests.
+
+### Why this is not a conflict with M3/M4
+
+Name lookup is a retrieval feature built on the existing peer registry. M3
+still implements replication, placement, and replica tracking. M4 still
+implements heartbeats, offline detection, retries, and repair. Once replication
+exists, the same name lookup automatically finds replica holders; no M3/M4
+design change is required.
+
+### Known limits
+
+- Only known peers are searched; there is no global filename index.
+- Duplicate-name selection trusts peer-provided timestamps.
+- Partial/substring name search is not included.
+- A name cannot make an offline sole holder available; M3/M4 provide that
+  reliability.
 
 ---
 
@@ -348,36 +514,17 @@ identical.
 
 ### Automated tests
 
-`cargo test` passes 22 tests:
-
-- chunker coverage
-- chunker determinism
-- empty input
-- small input
-- manifest round-trip
-- deterministic manifest bytes
-- invalid manifest total size
-- out-of-order chunks
-- config path derivation
-- identity stability across loads
-- identity rejects malformed keys
-- identity file permissions
-- metadata file storage and listing
-- metadata name resolution
-- metadata replica tracking
-- metadata restart persistence
-- local put/get round-trip
-- chunk deduplication
-- empty-file round-trip
-- store restart persistence
-- lookup by file name
-- listing stored files (metadata plus tag merge)
+`cargo test` passes 40 tests covering chunking, manifests, identity, redb
+metadata, bundle creation and reassembly, deduplication, restart persistence,
+name lookup, listing, the local HTTP API, peer registry, two-node transfer,
+remote retrieval by ticket and file ID, provider fallback, invalid tickets,
+unavailable providers, output atomicity, and metrics.
 
 ### Quality checks
 
 - `cargo fmt --check` passes.
 - `cargo clippy --all-targets -- -D warnings` passes.
-- `cargo test` passes 29 tests, including a two-node `MemoryLookup` transfer.
+- `cargo test` passes 40 tests, including two-node `MemoryLookup` transfers.
 
 ### Manual end-to-end test
 
@@ -388,14 +535,20 @@ A 1 MiB random file was stored and retrieved:
 - second put deduplicated: 1,048,576 bytes
 - lookup by file name: successful
 
+Remote ticket retrieval, file-ID discovery through known peers, and local
+caching were also exercised between separate daemons.
+
 ---
 
 ## Current Limitations
 
-- **Remote CLI retrieval is not wired yet.** Local `put/get/list` now go
-  through the daemon, but `get` still reads only from the local store.
-  Ticket-based remote retrieval and provider fallback are M2c. `send`/`receive`
-  transfer a whole raw blob and are not bundle-aware.
+- **Remote name lookup is planned, not implemented.** `p2p get <name>` resolves
+  names only from the local metadata today. Remote retrieval requires a ticket
+  or file ID until M2d is built.
+- **No automatic replication yet.** Remote retrieval caches a bundle on the
+  fetching node, but `put` does not proactively copy it to other peers.
+  Provider fallback therefore requires another node that already has the file.
+  `send`/`receive` still transfer a whole raw blob and are not bundle-aware.
 - **Whole file is read into memory.** The chunker currently reads the complete
   file before splitting it. Large-file streaming should be added before the
   replication milestone.
@@ -403,21 +556,25 @@ A 1 MiB random file was stored and retrieved:
   time, and an online flag, but heartbeats and offline detection are still M4.
 - **No authentication.** The local store is trusted; there is no peer
   authorization or encryption beyond iroh's transport security.
-- **Name collisions.** The `name/` mapping stores only the latest file with a
-  given name; older files remain reachable by file ID.
+- **Name collisions.** The local `name/` mapping stores only the latest file
+  with a given name; older files remain reachable by file ID. M2d extends this
+  with newest-wins selection across known peers.
 
 ---
 
 ## Next Steps
 
-The next milestone is remote retrieval, followed by replication and fault
-tolerance:
+The next milestone is name-based retrieval (M2d), followed by replication and
+fault tolerance:
 
 1. **M2 - Control protocol and two-node transfer**
    - M2a (complete): daemon, control ALPN, peer registry, HashSeq retrieval
    - M2b (complete): daemon-owned HTTP API, `api.addr` discovery, CLI commands,
      and `/health` metrics
-   - M2c: remote `get <file_id|ticket>`, fallback, and end-to-end docs
+   - M2c (complete): remote retrieval by ticket/file ID, provider fallback,
+     caching, timeouts, and failure hardening
+   - M2d (planned): exact filename search across known peers, `p2p search`,
+     newest-wins duplicate handling, and `get <name>` without a ticket
 2. **M3 - Replication**
    - replication factor
    - replica tracking

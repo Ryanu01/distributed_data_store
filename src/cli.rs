@@ -49,9 +49,9 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
     },
-    /// Reassemble a locally stored file through the local node.
+    /// Retrieve a file by ID, local name, or ticket through the local node.
     Get {
-        file_id: String,
+        target: String,
         output: PathBuf,
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
@@ -123,10 +123,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => receive(&ticket, &output, &data_dir).await,
         Command::Put { file, data_dir } => put(&file, &data_dir, api).await,
         Command::Get {
-            file_id,
+            target,
             output,
             data_dir,
-        } => get(&file_id, &output, &data_dir, api).await,
+        } => get(&target, &output, &data_dir, api).await,
         Command::List { data_dir } => list(&data_dir, api).await,
         Command::Status { data_dir } => status(&data_dir, api).await,
         Command::Health { data_dir } => health(&data_dir, api).await,
@@ -155,9 +155,9 @@ async fn put(file: &Path, data_dir: &Path, api: Option<SocketAddr>) -> Result<()
     Ok(())
 }
 
-async fn get(file_id: &str, output: &Path, data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
+async fn get(target: &str, output: &Path, data_dir: &Path, api: Option<SocketAddr>) -> Result<()> {
     let client = client(data_dir, api).await?;
-    let outcome = client.fetch_file(file_id, output).await?;
+    let outcome = client.fetch_file(target, output).await?;
 
     println!("Retrieved file:");
     println!("  file id : {}", outcome.file_id.to_hex());
